@@ -15,7 +15,6 @@ import (
 
 var DB *gorm.DB
 
-// Init инициализирует подключение к PostgreSQL
 func Init() error {
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
@@ -52,8 +51,6 @@ func Init() error {
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
 	DB = db
-
-	// Автомиграция моделей
 	err = db.AutoMigrate(
 		&Bot{},
 		&BotUser{},
@@ -66,7 +63,6 @@ func Init() error {
 	return nil
 }
 
-// Close закрывает соединение с БД
 func Close() error {
 	sqlDB, err := DB.DB()
 	if err != nil {
