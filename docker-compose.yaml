@@ -2,29 +2,55 @@ version: "3.8"
 
 services:
   postgres:
-    image: postgres:14
+    image: postgres:14-alpine
     environment:
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    volumes:
-      - ./migrations:/migrations
+      POSTGRES_DB: botadmin
     ports:
       - "5432:5432"
 
   redis:
-    image: redis
+    image: redis:7-alpine
     ports:
       - "6379:6379"
 
   admin-bot:
-    build: ./admin-bot
+    build:
+      context: ./app
+      dockerfile: admin-bot/Dockerfile
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=botadmin
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - BOT_TOKEN=${BOT_TOKEN}
     depends_on:
       - postgres
       - redis
 
   worker-bot:
-    build: ./worker-bot
+    build:
+      context: ./app
+      dockerfile: worker-bot/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
     depends_on:
       - postgres
       - redis
+
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
     ports:
-      - "8080:8080"
+      - "5050:80"
+    depends_on:
+      - postgres
