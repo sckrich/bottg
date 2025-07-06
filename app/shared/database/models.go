@@ -1,21 +1,12 @@
 package database
 
 import (
+	"encoding/json"
 	"time"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
-
-type Admin struct {
-	ID         uint   `gorm:"primaryKey"`
-	TelegramID int64  `gorm:"uniqueIndex"`
-	Username   string `gorm:"size:255"`
-	Role       string `gorm:"size:20;default:'admin'"`
-	IsActive   bool   `gorm:"default:true"`
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-}
 
 type Bot struct {
 	ID           uint           `gorm:"primaryKey"`
@@ -30,12 +21,13 @@ type Bot struct {
 }
 
 type BotTemplate struct {
-	ID        uint           `gorm:"primaryKey"`
-	BotID     uint           `gorm:"index"`
-	Name      string         `gorm:"size:255;index"`
-	Content   string         `gorm:"type:text"`
-	Keyboard  datatypes.JSON `gorm:"type:jsonb"`
-	IsActive  bool           `gorm:"default:true"`
+	ID        uint            `gorm:"primaryKey"`
+	UserID    int64           `db:"user_id" json:"user_id"`
+	BotID     uint            `gorm:"index"`
+	Name      string          `gorm:"size:255;index"`
+	Content   string          `gorm:"type:text"`
+	Keyboard  json.RawMessage `db:"keyboard" json:"keyboard"` // Используем RawMessage
+	IsActive  bool            `gorm:"default:true"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -48,15 +40,16 @@ type BotAccess struct {
 	CreatedAt   time.Time
 }
 
-type BotUser struct {
-	ID          uint           `gorm:"primaryKey"`
-	BotID       uint           `gorm:"index"`
-	TelegramID  int64          `gorm:"index"`
-	Phone       string         `gorm:"size:20"`
-	SessionData datatypes.JSON `gorm:"type:jsonb"`
-	LastActive  time.Time      `gorm:"index"`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+type User struct {
+	ID          uint   `gorm:"primaryKey"`
+	TelegramID  int64  `gorm:"uniqueIndex;not null"`
+	Username    string `gorm:"size:255"`
+	Phone       string `gorm:"size:20;unique"`
+	Role        string `gorm:"size:10;not null;check:role IN ('admin', 'owner', 'client')"`
+	IsActive    bool   `gorm:"default:true"`
+	SessionData []byte `gorm:"type:bytea"`
+	LastActive  time.Time
+	CreatedAt   time.Time `gorm:"default:now()"`
 }
 
 type ChatState struct {

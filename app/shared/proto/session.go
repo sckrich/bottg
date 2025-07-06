@@ -18,7 +18,7 @@ type SessionStorage struct {
 }
 
 func (s SessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
-	var user models.BotUser
+	var user models.User
 	if err := database.DB.WithContext(ctx).
 		Where("id = ?", s.UserID).
 		First(&user).Error; err != nil {
@@ -34,7 +34,7 @@ func (s SessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
 
 func (s SessionStorage) StoreSession(ctx context.Context, data []byte) error {
 	return database.DB.WithContext(ctx).
-		Model(&models.BotUser{}).
+		Model(&models.User{}).
 		Where("id = ?", s.UserID).
 		Update("session_data", data).Error
 }
@@ -62,7 +62,7 @@ func SaveAuthSession(ctx context.Context, userID int, data *session.Data) error 
 	}
 
 	return database.DB.WithContext(ctx).
-		Model(&models.BotUser{}).
+		Model(&models.User{}).
 		Where("id = ?", userID).
 		Updates(map[string]interface{}{
 			"session_data": bytes,

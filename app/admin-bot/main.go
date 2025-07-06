@@ -1,8 +1,11 @@
 package main
 
 import (
+	"admin-bot/models"
+	"admin-bot/repositories"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"admin-bot/models"
-
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	_ "github.com/lib/pq"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 type UserState struct {
@@ -31,19 +34,41 @@ var (
 	stateMutex sync.RWMutex
 )
 
+type StateData struct {
+	Buttons [][]string `json:"buttons"`
+}
+
+func (s *StateData) Value() (driver.Value, error) {
+	return json.Marshal(s)
+}
+
+func (s *StateData) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("type assertion to []byte failed")
+	}
+	return json.Unmarshal(b, &s)
+}
+
 func main() {
+	// Инициализация бота
 	var err error
 	bot, err = tgbotapi.NewBotAPI(os.Getenv("BOT_TOKEN"))
 	if err != nil {
 		log.Panic(err)
 	}
 
+	// Инициализация базы данных
 	db, err = initDB()
 	if err != nil {
-		log.Panic(err)
+		log.Panicf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
 
+	// Проверка таблиц (только после инициализации db)
+	if err := checkDatabase(); err != nil {
+		log.Panicf("Database check failed: %v", err)
+	}
 	bot.Debug = true
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
@@ -62,21 +87,40 @@ func main() {
 	}
 }
 
+func checkDatabase() error {
+	requiredTables := []string{"bot_templates", "users"}
+	for _, table := range requiredTables {
+		var exists bool
+		err := db.QueryRow(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = $1
+            )`, table).Scan(&exists)
+
+		if err != nil || !exists {
+			return fmt.Errorf("table %s check failed", table)
+		}
+	}
+	return nil
+}
+
 func initDB() (*sql.DB, error) {
-	connStr := fmt.Sprintf("host=%s user=%s password=%s dbname=%s sslmode=disable",
-		os.Getenv("DB_HOST"), os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_NAME"))
+	connStr := fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_NAME"),
+	)
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		return nil, fmt.Errorf("connection string error: %v", err)
+		return nil, fmt.Errorf("connection failed: %v", err)
 	}
 
-	// Важные настройки пула соединений
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetMaxOpenConns(10)
+	db.SetConnMaxLifetime(10 * time.Minute)
 
-	// Проверка подключения с таймаутом
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -86,6 +130,7 @@ func initDB() (*sql.DB, error) {
 
 	return db, nil
 }
+
 func handleMessage(message *tgbotapi.Message) {
 	state := getUserState(message.From.ID)
 
@@ -116,7 +161,6 @@ func handleMessage(message *tgbotapi.Message) {
 
 			var keyboard [][]string
 			if err := json.Unmarshal([]byte(normalizedInput), &keyboard); err != nil {
-				// Показываем пользователю где именно ошибка
 				errorPos := strings.Index(err.Error(), "offset ")
 				if errorPos > 0 {
 					posStr := err.Error()[errorPos+7:]
@@ -129,7 +173,6 @@ func handleMessage(message *tgbotapi.Message) {
 				return
 			}
 
-			// Дополнительная проверка структуры
 			if len(keyboard) == 0 {
 				sendMessage(message.Chat.ID, "❌ Клавиатура не может быть пустой")
 				return
@@ -178,6 +221,7 @@ func handleMessage(message *tgbotapi.Message) {
 
 			clearUserState(message.From.ID)
 			sendMessage(message.Chat.ID, "✅ Шаблон успешно создан!")
+			ShowOwnerPanel(bot, message.Chat.ID)
 			return
 		}
 	}
@@ -185,27 +229,140 @@ func handleMessage(message *tgbotapi.Message) {
 	if message.IsCommand() {
 		switch message.Command() {
 		case "start":
-			sendMainMenu(message.Chat.ID)
+			gormDB, err := gorm.Open(postgres.New(postgres.Config{
+				Conn: db,
+			}), &gorm.Config{})
+			if err != nil {
+				log.Printf("Failed to create gorm DB: %v", err)
+				sendMessage(message.Chat.ID, "❌ Ошибка инициализации")
+				return
+			}
+
+			update := tgbotapi.Update{
+				Message: message,
+			}
+
+			HandleStart(bot, gormDB, update)
 			return
 		}
 	}
 
 	sendMessage(message.Chat.ID, "Используйте кнопки меню")
 }
+
+func AddTemplateHandler(bot *tgbotapi.BotAPI, db *sql.DB, userID int64, chatID int64) {
+	setUserState(userID, &UserState{
+		CurrentAction: "awaiting_template_name",
+		TempData:      make(map[string]interface{}),
+	})
+
+	msg := tgbotapi.NewMessage(chatID, "📝 Создание нового шаблона\n\nВведите название шаблона:")
+	msg.ReplyMarkup = getCancelKeyboard()
+	send(msg)
+}
+
+func CompleteTemplateCreation(bot *tgbotapi.BotAPI, db *sql.DB, userID int64, chatID int64, templateData map[string]interface{}) error {
+	name, ok := templateData["name"].(string)
+	if !ok || strings.TrimSpace(name) == "" {
+		sendMessage(chatID, "❌ Неверное название шаблона")
+		return fmt.Errorf("invalid template name")
+	}
+
+	content, ok := templateData["content"].(string)
+	if !ok || strings.TrimSpace(content) == "" {
+		sendMessage(chatID, "❌ Неверное содержание шаблона")
+		return fmt.Errorf("invalid template content")
+	}
+
+	keyboard, ok := templateData["keyboard"].([][]string)
+	if !ok || len(keyboard) == 0 {
+		sendMessage(chatID, "❌ Неверный формат клавиатуры")
+		return fmt.Errorf("invalid keyboard format")
+	}
+
+	keyboardJSON, err := json.Marshal(keyboard)
+	if err != nil {
+		sendMessage(chatID, "❌ Ошибка обработки клавиатуры")
+		return fmt.Errorf("keyboard marshal error: %v", err)
+	}
+
+	query := `
+        INSERT INTO bot_templates 
+        (user_id, name, content, keyboard, is_active, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id`
+
+	var templateID int64
+	err = db.QueryRow(query,
+		userID,
+		name,
+		content,
+		keyboardJSON,
+		true,
+		time.Now(),
+		time.Now(),
+	).Scan(&templateID)
+
+	if err != nil {
+		log.Printf("Ошибка при сохранении шаблона: %v", err)
+		sendMessage(chatID, "❌ Ошибка при сохранении шаблона в БД")
+		return fmt.Errorf("database error: %v", err)
+	}
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"✅ Шаблон успешно создан!\n\nID: %d\nНазвание: %s\n\nТеперь вы можете использовать его при создании ботов.",
+		templateID, name))
+
+	send(msg)
+	return nil
+}
+
+func ShowTemplateDetails(bot *tgbotapi.BotAPI, chatID int64, template models.BotTemplate) {
+	var keyboard [][]string
+	if err := json.Unmarshal(template.Keyboard, &keyboard); err != nil {
+		log.Printf("Ошибка разбора клавиатуры: %v", err)
+		keyboard = [][]string{{"Ошибка отображения"}}
+	}
+
+	msgText := fmt.Sprintf(
+		"📋 Шаблон: %s\n\nID: %d\nСодержание:\n%s\n\nКлавиатура:",
+		template.Name, template.ID, template.Content)
+
+	for _, row := range keyboard {
+		msgText += "\n"
+		for _, btn := range row {
+			msgText += fmt.Sprintf("[%s] ", btn)
+		}
+	}
+
+	msg := tgbotapi.NewMessage(chatID, msgText)
+
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Редактировать", fmt.Sprintf("edit_template:%d", template.ID)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Удалить", fmt.Sprintf("delete_template:%d", template.ID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "list_templates"),
+		),
+	)
+
+	send(msg)
+}
+
 func normalizeJSONInput(input string) (string, error) {
 	input = strings.TrimSpace(input)
 
-	// Удаляем все пробелы между кавычками и текстом
 	re := regexp.MustCompile(`"\s*([^"]+?)\s*"`)
 	input = re.ReplaceAllString(input, `"$1"`)
 
-	// Проверяем баланс скобок
 	if strings.Count(input, "[") != strings.Count(input, "]") {
 		return "", fmt.Errorf("unbalanced brackets")
 	}
 
 	return input, nil
 }
+
 func sendJSONError(chatID int64) {
 	example := `Пример правильного формата JSON для клавиатуры:
     
@@ -226,18 +383,53 @@ func sendJSONError(chatID int64) {
 	msg.ReplyMarkup = getCancelKeyboard()
 	send(msg)
 }
-func sendJSONFormatError(chatID int64) {
-	example := `Пример правильного формата:
-[
-    ["Да", "Нет"],
-    ["Может быть"]
-]`
+func HandleStart(bot *tgbotapi.BotAPI, db *gorm.DB, update tgbotapi.Update) {
+	userRepo := repositories.NewUserRepository(db)
+	telegramID := update.Message.From.ID
+	username := update.Message.From.UserName
+	user, err := userRepo.GetOrCreate(telegramID, username, "owner")
+	if err != nil {
+		log.Printf("Ошибка создания пользователя: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Ошибка инициализации")
+		bot.Send(msg)
+		return
+	}
+	isOwner, err := userRepo.IsOwner(user.TelegramID)
+	if err != nil {
+		log.Printf("Ошибка проверки владельца: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Ошибка проверки доступа")
+		bot.Send(msg)
+		return
+	}
 
-	msg := tgbotapi.NewMessage(chatID, "❌ Неверный формат JSON. Пожалуйста, используйте следующий формат:\n"+example)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = getCancelKeyboard()
-	send(msg)
+	if !isOwner {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "⛔ Доступ только для владельцев")
+		bot.Send(msg)
+		return
+	}
+
+	ShowOwnerPanel(bot, update.Message.Chat.ID)
 }
+
+func ShowOwnerPanel(bot *tgbotapi.BotAPI, chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "👑 Панель владельца")
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🤖 Мои боты", "my_bots"),
+			tgbotapi.NewInlineKeyboardButtonData("📝 Шаблоны", "templates"),
+			tgbotapi.NewInlineKeyboardButtonData("➕ Создать шаблон", "add_template"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Настройки", "settings"),
+			tgbotapi.NewInlineKeyboardButtonData("💳 Тарифы", "billing"),
+		),
+	)
+
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
 func handleCallback(callback *tgbotapi.CallbackQuery) {
 	callbackCfg := tgbotapi.NewCallback(callback.ID, "")
 	bot.Request(callbackCfg)
@@ -246,7 +438,6 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 	action := parts[0]
 
 	switch action {
-
 	case "add_bot":
 		if len(parts) < 2 {
 			sendMessage(callback.Message.Chat.ID, "Ошибка выбора шаблона")
@@ -259,6 +450,37 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 		})
 		sendMessage(callback.Message.Chat.ID, "Введите токен бота:")
 
+	case "add_template":
+		AddTemplateHandler(bot, db, callback.From.ID, callback.Message.Chat.ID)
+
+	case "list_templates":
+		templates := getUserTemplates(callback.From.ID)
+		if len(templates) == 0 {
+			sendMessage(callback.Message.Chat.ID, "У вас пока нет шаблонов.")
+			return
+		}
+		ShowTemplatesList(bot, callback.Message.Chat.ID, templates)
+
+	case "view_template":
+		if len(parts) < 2 {
+			sendMessage(callback.Message.Chat.ID, "Ошибка: не указан ID шаблона")
+			return
+		}
+
+		templateID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			sendMessage(callback.Message.Chat.ID, "Ошибка: неверный ID шаблона")
+			return
+		}
+
+		template := getTemplateByID(templateID)
+		if template == nil {
+			sendMessage(callback.Message.Chat.ID, "Шаблон не найден")
+			return
+		}
+
+		ShowTemplateDetails(bot, callback.Message.Chat.ID, *template)
+
 	case "view_templates":
 		templates := getUserTemplates(callback.From.ID)
 		if len(templates) == 0 {
@@ -270,99 +492,137 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 			msg += fmt.Sprintf("\n🔹 %s (ID: %d)", t.Name, t.ID)
 		}
 		sendMessage(callback.Message.Chat.ID, msg)
-	case "add_template":
-		setUserState(callback.From.ID, &UserState{
-			CurrentAction: "awaiting_template_name",
-			TempData:      make(map[string]interface{}),
-		})
-		msg := tgbotapi.NewMessage(callback.Message.Chat.ID, "Введите название шаблона:")
-		msg.ReplyMarkup = getCancelKeyboard()
-		send(msg)
+
+	case "templates":
+		templates := getUserTemplates(callback.From.ID)
+		if len(templates) == 0 {
+			msg := tgbotapi.NewMessage(callback.Message.Chat.ID, "У вас пока нет шаблонов. Хотите создать новый?")
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("➕ Создать шаблон", "add_template"),
+					tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "main_menu"),
+				),
+			)
+			send(msg)
+			return
+		}
+		ShowTemplatesList(bot, callback.Message.Chat.ID, templates)
 	case "cancel":
 		clearUserState(callback.From.ID)
 		sendMessage(callback.Message.Chat.ID, "Действие отменено")
-		sendMainMenu(callback.Message.Chat.ID)
+		ShowOwnerPanel(bot, callback.Message.Chat.ID)
+	case "main_menu":
+		clearUserState(callback.From.ID)
+		ShowOwnerPanel(bot, callback.Message.Chat.ID)
 	}
 }
 
-func sendMainMenu(chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "📱 Главное меню")
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить бота", "add_bot_menu"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📝 Создать шаблон", "add_template"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("👀 Мои шаблоны", "view_templates"),
-		),
-	)
-	msg.ReplyMarkup = keyboard
+func ShowTemplatesList(bot *tgbotapi.BotAPI, chatID int64, templates []models.BotTemplate) {
+	if len(templates) == 0 {
+		sendMessage(chatID, "У вас пока нет шаблонов.")
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, "📂 Ваши шаблоны:")
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for _, t := range templates {
+		btn := tgbotapi.NewInlineKeyboardButtonData(
+			fmt.Sprintf("%s (ID: %d)", t.Name, t.ID),
+			fmt.Sprintf("view_template:%d", t.ID),
+		)
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
+	}
+
+	// Добавляем кнопки управления
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("➕ Создать новый", "add_template"),
+		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "main_menu"),
+	))
+
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	send(msg)
 }
-func saveTemplate(userID int64, data map[string]interface{}) error {
-	log.Printf("Attempting to save template for user %d\nData: %+v", userID, data)
 
-	// 1. Извлечение данных с проверкой типов
-	name, _ := data["name"].(string)
-	content, _ := data["content"].(string)
+func getTemplateByID(templateID int64) *models.BotTemplate {
+	row := db.QueryRow(`
+        SELECT id, user_id, name, content, keyboard, is_active, created_at, updated_at
+        FROM bot_templates WHERE id = $1`, templateID)
+
+	var t models.BotTemplate
+	var keyboardJSON []byte
+
+	err := row.Scan(
+		&t.ID,
+		&t.UserID,
+		&t.Name,
+		&t.Content,
+		&keyboardJSON,
+		&t.IsActive,
+		&t.CreatedAt,
+		&t.UpdatedAt,
+	)
+
+	if err != nil {
+		log.Printf("Ошибка при получении шаблона: %v", err)
+		return nil
+	}
+
+	t.Keyboard = keyboardJSON
+	return &t
+}
+func saveTemplate(userID int64, data map[string]interface{}) error {
+	if err := db.Ping(); err != nil {
+		log.Printf("Database ping failed: %v", err)
+		return fmt.Errorf("database connection error")
+	}
+
+	name, ok := data["name"].(string)
+	if !ok {
+		return fmt.Errorf("invalid name data")
+	}
+
+	content, ok := data["content"].(string)
+	if !ok {
+		return fmt.Errorf("invalid content data")
+	}
+
 	keyboard, ok := data["keyboard"].([][]string)
 	if !ok {
-		return fmt.Errorf("keyboard type assertion failed")
+		return fmt.Errorf("invalid keyboard data")
 	}
 
-	// 2. Преобразование клавиатуры в JSON
 	keyboardJSON, err := json.Marshal(keyboard)
 	if err != nil {
-		log.Printf("Keyboard marshal error: %v\nKeyboard: %v", err, keyboard)
-		return fmt.Errorf("keyboard marshal error")
+		log.Printf("Keyboard marshal error: %v", err)
+		return fmt.Errorf("keyboard format error")
 	}
 
-	// 3. Проверка существования пользователя
-	var userExists bool
-	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", userID).Scan(&userExists)
-	if err != nil || !userExists {
-		return fmt.Errorf("user verification failed")
-	}
+	query := `
+        INSERT INTO bot_templates 
+        (user_id, name, content, keyboard, is_active, created_at) 
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id`
 
-	// 4. Выполнение запроса с транзакцией
-	tx, err := db.Begin()
+	var id int64
+	err = db.QueryRow(query,
+		userID,
+		name,
+		content,
+		string(keyboardJSON),
+		true,
+		time.Now(),
+	).Scan(&id)
+
 	if err != nil {
-		log.Printf("Transaction begin error: %v", err)
-		return fmt.Errorf("transaction error")
-	}
-	defer tx.Rollback()
-
-	// 5. Логируем полный SQL-запрос
-	query := `INSERT INTO bot_templates 
-             (user_id, name, content, keyboard, is_active, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)`
-
-	log.Printf("Executing query: %s\nParams: %d, %s, %s, %s, %v, %v",
-		query, userID, name, content, string(keyboardJSON), true, time.Now())
-
-	_, err = tx.Exec(query, userID, name, content, keyboardJSON, true, time.Now())
-	if err != nil {
-		log.Printf("Database error: %v", err)
-		return fmt.Errorf("database execution error")
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("Commit error: %v", err)
-		return fmt.Errorf("transaction commit error")
+		log.Printf("Database error: %v\nQuery: %s\nParams: %d, %s, %s, %s, %v, %v",
+			err, query, userID, name, content, string(keyboardJSON), true, time.Now())
+		return fmt.Errorf("database save error")
 	}
 
 	return nil
 }
-func saveBot(userID int64, token string, templateID int64) error {
-	_, err := db.Exec(`
-		INSERT INTO bots 
-		(user_id, token, template_id, created_at)
-		VALUES ($1, $2, $3, $4)`,
-		userID, token, templateID, time.Now())
-	return err
-}
+
 func getCancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -370,6 +630,7 @@ func getCancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 		),
 	)
 }
+
 func getUserTemplates(userID int64) []models.BotTemplate {
 	rows, err := db.Query(`
         SELECT id, user_id, name, content, keyboard, is_active, created_at, updated_at
@@ -408,24 +669,6 @@ func getUserTemplates(userID int64) []models.BotTemplate {
 
 	return templates
 }
-func parseBotID(text string) (int64, error) {
-	var botID int64
-	_, err := fmt.Sscanf(text, "%d", &botID)
-	return botID, err
-}
-
-func sendAdminPanel(chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "🛠 Админ-панель управления шаблонами")
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📝 Создать шаблон", "add_template"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "cancel_template"),
-		),
-	)
-	send(msg)
-}
 
 func sendMessage(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
@@ -438,7 +681,6 @@ func send(msg tgbotapi.Chattable) {
 	}
 }
 
-// Управление состояниями
 func setUserState(userID int64, state *UserState) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -455,4 +697,18 @@ func clearUserState(userID int64) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
 	delete(userStates, userID)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
