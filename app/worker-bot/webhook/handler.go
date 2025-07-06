@@ -61,7 +61,6 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, redis *models.Re
 		log.Printf("Error getting bot state: %v", err)
 		return
 	}
-
 	if state == nil {
 		state = &models.BotState{
 			UserID:      userID,

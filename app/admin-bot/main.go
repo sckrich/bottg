@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"regexp"
 	"strconv"
@@ -25,6 +26,7 @@ import (
 type UserState struct {
 	CurrentAction string
 	TempData      map[string]interface{}
+	BotToken      string
 }
 
 var (
@@ -129,125 +131,6 @@ func initDB() (*sql.DB, error) {
 	}
 
 	return db, nil
-}
-
-func handleMessage(message *tgbotapi.Message) {
-	state := getUserState(message.From.ID)
-
-	if state != nil {
-		switch state.CurrentAction {
-		case "awaiting_template_name":
-			state.TempData["name"] = message.Text
-			state.CurrentAction = "awaiting_template_content"
-			msg := tgbotapi.NewMessage(message.Chat.ID, "Введите содержание шаблона:")
-			msg.ReplyMarkup = getCancelKeyboard()
-			send(msg)
-			return
-
-		case "awaiting_template_content":
-			state.TempData["content"] = message.Text
-			state.CurrentAction = "awaiting_template_keyboard"
-			msg := tgbotapi.NewMessage(message.Chat.ID, "Введите клавиатуру в JSON формате (пример: [[\"Да\"], [\"Нет\"]]):")
-			msg.ReplyMarkup = getCancelKeyboard()
-			send(msg)
-			return
-
-		case "awaiting_template_keyboard":
-			normalizedInput, err := normalizeJSONInput(message.Text)
-			if err != nil {
-				sendJSONError(message.Chat.ID)
-				return
-			}
-
-			var keyboard [][]string
-			if err := json.Unmarshal([]byte(normalizedInput), &keyboard); err != nil {
-				errorPos := strings.Index(err.Error(), "offset ")
-				if errorPos > 0 {
-					posStr := err.Error()[errorPos+7:]
-					if pos, e := strconv.Atoi(posStr); e == nil {
-						excerpt := normalizedInput[max(0, pos-10):min(len(normalizedInput), pos+10)]
-						sendMessage(message.Chat.ID, fmt.Sprintf("❌ Ошибка в позиции ~%d: ...%s...", pos, excerpt))
-					}
-				}
-				sendJSONError(message.Chat.ID)
-				return
-			}
-
-			if len(keyboard) == 0 {
-				sendMessage(message.Chat.ID, "❌ Клавиатура не может быть пустой")
-				return
-			}
-
-			for _, row := range keyboard {
-				if len(row) == 0 {
-					sendMessage(message.Chat.ID, "❌ Строка клавиатуры не может быть пустой")
-					return
-				}
-				for _, button := range row {
-					if strings.TrimSpace(button) == "" {
-						sendMessage(message.Chat.ID, "❌ Текст кнопки не может быть пустым")
-						return
-					}
-				}
-			}
-
-			state.TempData["keyboard"] = keyboard
-
-			if err := saveTemplate(message.From.ID, state.TempData); err != nil {
-				log.Printf("Full save error: %v\nTemplate data: %+v", err, state.TempData)
-
-				detailedMsg := "❌ Ошибка сохранения:\n"
-
-				switch {
-				case strings.Contains(err.Error(), "invalid template name"):
-					detailedMsg += "Некорректное имя шаблона"
-				case strings.Contains(err.Error(), "invalid template content"):
-					detailedMsg += "Некорректное содержание шаблона"
-				case strings.Contains(err.Error(), "invalid keyboard"):
-					detailedMsg += "Некорректный формат клавиатуры"
-				case strings.Contains(err.Error(), "database"):
-					detailedMsg += "Проблема с базой данных"
-				default:
-					detailedMsg += "Техническая ошибка"
-				}
-
-				detailedMsg += "\n\nПопробуйте ещё раз или обратитесь в поддержку"
-
-				msg := tgbotapi.NewMessage(message.Chat.ID, detailedMsg)
-				msg.ReplyMarkup = getCancelKeyboard()
-				send(msg)
-				return
-			}
-
-			clearUserState(message.From.ID)
-			sendMessage(message.Chat.ID, "✅ Шаблон успешно создан!")
-			ShowOwnerPanel(bot, message.Chat.ID)
-			return
-		}
-	}
-
-	if message.IsCommand() {
-		switch message.Command() {
-		case "start":
-			gormDB, err := gorm.Open(postgres.New(postgres.Config{
-				Conn: db,
-			}), &gorm.Config{})
-			if err != nil {
-				log.Printf("Failed to create gorm DB: %v", err)
-				sendMessage(message.Chat.ID, "❌ Ошибка инициализации")
-				return
-			}
-
-			update := tgbotapi.Update{
-				Message: message,
-			}
-
-			HandleStart(bot, gormDB, update)
-			return
-		}
-	}
-
-	sendMessage(message.Chat.ID, "Используйте кнопки меню")
 }
 
 func AddTemplateHandler(bot *tgbotapi.BotAPI, db *sql.DB, userID int64, chatID int64) {
@@ -416,7 +299,7 @@ func ShowOwnerPanel(bot *tgbotapi.BotAPI, chatID int64) {
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🤖 Мои боты", "my_bots"),
+			tgbotapi.NewInlineKeyboardButtonData("🤖 Добавить бота", "add_bot"),
 			tgbotapi.NewInlineKeyboardButtonData("📝 Шаблоны", "templates"),
 			tgbotapi.NewInlineKeyboardButtonData("➕ Создать шаблон", "add_template"),
 		),
@@ -429,7 +312,6 @@ func ShowOwnerPanel(bot *tgbotapi.BotAPI, chatID int64) {
 	msg.ReplyMarkup = keyboard
 	bot.Send(msg)
 }
-
 func handleCallback(callback *tgbotapi.CallbackQuery) {
 	callbackCfg := tgbotapi.NewCallback(callback.ID, "")
 	bot.Request(callbackCfg)
@@ -439,20 +321,13 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 
 	switch action {
 	case "add_bot":
-		if len(parts) < 2 {
-			sendMessage(callback.Message.Chat.ID, "Ошибка выбора шаблона")
-			return
-		}
-		templateID, _ := strconv.ParseInt(parts[1], 10, 64)
-		setUserState(callback.From.ID, &UserState{
-			CurrentAction: "awaiting_bot_token",
-			TempData:      map[string]interface{}{"template_id": templateID},
-		})
-		sendMessage(callback.Message.Chat.ID, "Введите токен бота:")
-
+		handleAddBotStart(callback)
+	case "select_template_for_bot":
+		handleSelectTemplateForBot(callback)
+	case "confirm_bot_creation":
+		handleConfirmBotCreation(callback)
 	case "add_template":
 		AddTemplateHandler(bot, db, callback.From.ID, callback.Message.Chat.ID)
-
 	case "list_templates":
 		templates := getUserTemplates(callback.From.ID)
 		if len(templates) == 0 {
@@ -460,27 +335,22 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 			return
 		}
 		ShowTemplatesList(bot, callback.Message.Chat.ID, templates)
-
 	case "view_template":
 		if len(parts) < 2 {
 			sendMessage(callback.Message.Chat.ID, "Ошибка: не указан ID шаблона")
 			return
 		}
-
 		templateID, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
 			sendMessage(callback.Message.Chat.ID, "Ошибка: неверный ID шаблона")
 			return
 		}
-
 		template := getTemplateByID(templateID)
 		if template == nil {
 			sendMessage(callback.Message.Chat.ID, "Шаблон не найден")
 			return
 		}
-
 		ShowTemplateDetails(bot, callback.Message.Chat.ID, *template)
-
 	case "view_templates":
 		templates := getUserTemplates(callback.From.ID)
 		if len(templates) == 0 {
@@ -492,7 +362,6 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 			msg += fmt.Sprintf("\n🔹 %s (ID: %d)", t.Name, t.ID)
 		}
 		sendMessage(callback.Message.Chat.ID, msg)
-
 	case "templates":
 		templates := getUserTemplates(callback.From.ID)
 		if len(templates) == 0 {
@@ -515,6 +384,114 @@ func handleCallback(callback *tgbotapi.CallbackQuery) {
 		clearUserState(callback.From.ID)
 		ShowOwnerPanel(bot, callback.Message.Chat.ID)
 	}
+}
+
+func handleConfirmBotCreation(callback *tgbotapi.CallbackQuery) {
+	state := getUserState(callback.From.ID)
+	if state == nil || state.CurrentAction != "awaiting_ref_code" {
+		sendMessage(callback.Message.Chat.ID, "Ошибка: данные не найдены")
+		return
+	}
+
+	botToken, ok := state.TempData["bot_token"].(string)
+	if !ok {
+		sendMessage(callback.Message.Chat.ID, "Ошибка: токен бота не найден")
+		return
+	}
+
+	templateID, ok := state.TempData["template_id"].(int64)
+	if !ok {
+		sendMessage(callback.Message.Chat.ID, "Ошибка: шаблон не выбран")
+		return
+	}
+
+	refCode, ok := state.TempData["ref_code"].(string)
+	if !ok {
+		refCode = generateRefCode()
+	}
+
+	// Создаем бота в базе данных
+	err := createBotInDB(callback.From.ID, botToken, templateID, refCode)
+	if err != nil {
+		sendMessage(callback.Message.Chat.ID, "Ошибка при создании бота: "+err.Error())
+		return
+	}
+
+	// Регистрируем вебхук
+	err = registerWebhook(botToken)
+	if err != nil {
+		sendMessage(callback.Message.Chat.ID, "Бот создан, но не удалось зарегистрировать вебхук: "+err.Error())
+		return
+	}
+
+	// Запускаем Worker для обработки этого бота
+	go startBotWorker(botToken, templateID)
+
+	sendMessage(callback.Message.Chat.ID, fmt.Sprintf(
+		"✅ Бот успешно создан!\n\nТокен: %s\nШаблон: %d\nРеферальный код: %s",
+		maskToken(botToken), templateID, refCode))
+
+	clearUserState(callback.From.ID)
+	ShowOwnerPanel(bot, callback.Message.Chat.ID)
+}
+
+func createBotInDB(userID int64, botToken string, templateID int64, refCode string) error {
+	query := `
+		INSERT INTO bots 
+		(user_id, bot_token, template_id, ref_code, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+	_, err := db.Exec(query,
+		userID,
+		botToken,
+		templateID,
+		refCode,
+		true,
+		time.Now(),
+		time.Now(),
+	)
+
+	return err
+}
+
+func registerWebhook(botToken string) error {
+	// URL вебхука должен быть зарегистрирован для всех ботов
+	webhookURL := os.Getenv("WEBHOOK_URL") + "/webhook/" + botToken
+
+	botAPI, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		return err
+	}
+
+	// Исправленная часть:
+	wh, err := tgbotapi.NewWebhook(webhookURL)
+	if err != nil {
+		return fmt.Errorf("failed to create webhook config: %v", err)
+	}
+
+	_, err = botAPI.Request(wh)
+	return err
+}
+
+func startBotWorker(botToken string, templateID int64) {
+	// Здесь должна быть реализация Worker для обработки бота
+	// Это может быть отдельный процесс, который слушает обновления
+	// и обрабатывает их согласно шаблону
+
+	log.Printf("Starting worker for bot with token: %s and template: %d", maskToken(botToken), templateID)
+
+	// Реализация Worker будет зависеть от вашей архитектуры
+	// Это может быть вызов внешнего сервиса или запуск горутины
+}
+
+func generateRefCode() string {
+	// Генерация случайного реферального кода
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 8)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
 }
 
 func ShowTemplatesList(bot *tgbotapi.BotAPI, chatID int64, templates []models.BotTemplate) {
@@ -711,4 +688,277 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+func handleAddBotStart(callback *tgbotapi.CallbackQuery) {
+	setUserState(callback.From.ID, &UserState{
+		CurrentAction: "awaiting_bot_token",
+		TempData:      make(map[string]interface{}),
+	})
+
+	msg := tgbotapi.NewMessage(callback.Message.Chat.ID, "Введите токен бота (например: 7806164396:AAGe9mPOFwGhUhxR3qscVW4wToCB4miNokA):")
+	msg.ReplyMarkup = getCancelKeyboard()
+	send(msg)
+}
+
+// Модифицированный обработчик сообщений
+func handleMessage(message *tgbotapi.Message) {
+	state := getUserState(message.From.ID)
+
+	if state != nil {
+		switch state.CurrentAction {
+		case "awaiting_template_name":
+			state.TempData["name"] = message.Text
+			state.CurrentAction = "awaiting_template_content"
+			msg := tgbotapi.NewMessage(message.Chat.ID, "Введите содержание шаблона:")
+			msg.ReplyMarkup = getCancelKeyboard()
+			send(msg)
+			return
+
+		case "awaiting_template_content":
+			state.TempData["content"] = message.Text
+			state.CurrentAction = "awaiting_template_keyboard"
+			msg := tgbotapi.NewMessage(message.Chat.ID, "Введите клавиатуру в JSON формате (пример: [[\"Да\"], [\"Нет\"]]):")
+			msg.ReplyMarkup = getCancelKeyboard()
+			send(msg)
+			return
+
+		case "awaiting_template_keyboard":
+			normalizedInput, err := normalizeJSONInput(message.Text)
+			if err != nil {
+				sendJSONError(message.Chat.ID)
+				return
+			}
+
+			var keyboard [][]string
+			if err := json.Unmarshal([]byte(normalizedInput), &keyboard); err != nil {
+				errorPos := strings.Index(err.Error(), "offset ")
+				if errorPos > 0 {
+					posStr := err.Error()[errorPos+7:]
+					if pos, e := strconv.Atoi(posStr); e == nil {
+						excerpt := normalizedInput[max(0, pos-10):min(len(normalizedInput), pos+10)]
+						sendMessage(message.Chat.ID, fmt.Sprintf("❌ Ошибка в позиции ~%d: ...%s...", pos, excerpt))
+					}
+				}
+				sendJSONError(message.Chat.ID)
+				return
+			}
+
+			if len(keyboard) == 0 {
+				sendMessage(message.Chat.ID, "❌ Клавиатура не может быть пустой")
+				return
+			}
+
+			for _, row := range keyboard {
+				if len(row) == 0 {
+					sendMessage(message.Chat.ID, "❌ Строка клавиатуры не может быть пустой")
+					return
+				}
+				for _, button := range row {
+					if strings.TrimSpace(button) == "" {
+						sendMessage(message.Chat.ID, "❌ Текст кнопки не может быть пустым")
+						return
+					}
+				}
+			}
+
+			state.TempData["keyboard"] = keyboard
+
+			if err := saveTemplate(message.From.ID, state.TempData); err != nil {
+				log.Printf("Full save error: %v\nTemplate data: %+v", err, state.TempData)
+
+				detailedMsg := "❌ Ошибка сохранения:\n"
+
+				switch {
+				case strings.Contains(err.Error(), "invalid template name"):
+					detailedMsg += "Некорректное имя шаблона"
+				case strings.Contains(err.Error(), "invalid template content"):
+					detailedMsg += "Некорректное содержание шаблона"
+				case strings.Contains(err.Error(), "invalid keyboard"):
+					detailedMsg += "Некорректный формат клавиатуры"
+				case strings.Contains(err.Error(), "database"):
+					detailedMsg += "Проблема с базой данных"
+				default:
+					detailedMsg += "Техническая ошибка"
+				}
+
+				detailedMsg += "\n\nПопробуйте ещё раз или обратитесь в поддержку"
+
+				msg := tgbotapi.NewMessage(message.Chat.ID, detailedMsg)
+				msg.ReplyMarkup = getCancelKeyboard()
+				send(msg)
+				return
+			}
+
+			clearUserState(message.From.ID)
+			sendMessage(message.Chat.ID, "✅ Шаблон успешно создан!")
+			ShowOwnerPanel(bot, message.Chat.ID)
+			return
+		case "awaiting_bot_token":
+			// Проверяем формат токена (без префикса "bot")
+			if !isValidBotToken(message.Text) {
+				sendMessage(message.Chat.ID, "❌ Неверный формат токена. Токен должен быть в формате 1234567890:ABCdefghijk_Lmnopqrstuvwxyz")
+				return
+			}
+
+			// Сохраняем токен в состоянии
+			state.BotToken = message.Text
+			state.CurrentAction = "selecting_template"
+
+			// Показываем список шаблонов
+			templates := getUserTemplates(message.From.ID)
+			if len(templates) == 0 {
+				sendMessage(message.Chat.ID, "❌ У вас нет шаблонов. Сначала создайте шаблон.")
+				clearUserState(message.From.ID)
+				return
+			}
+
+			var buttons [][]tgbotapi.InlineKeyboardButton
+			for _, t := range templates {
+				buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData(
+						t.Name,
+						fmt.Sprintf("select_template_for_bot:%d", t.ID),
+					),
+				))
+			}
+
+			msg := tgbotapi.NewMessage(message.Chat.ID, "Выберите шаблон для бота:")
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+			send(msg)
+			return
+
+		case "awaiting_ref_code":
+			state.TempData["ref_code"] = message.Text
+			confirmBotCreation(message.Chat.ID, message.From.ID)
+			return
+		}
+	}
+	if message.IsCommand() {
+		switch message.Command() {
+		case "start":
+			gormDB, err := gorm.Open(postgres.New(postgres.Config{
+				Conn: db,
+			}), &gorm.Config{})
+			if err != nil {
+				log.Printf("Failed to create gorm DB: %v", err)
+				sendMessage(message.Chat.ID, "❌ Ошибка инициализации")
+				return
+			}
+
+			update := tgbotapi.Update{
+				Message: message,
+			}
+
+			HandleStart(bot, gormDB, update)
+			return
+		}
+	}
+	sendMessage(message.Chat.ID, "Используйте кнопки меню")
+}
+
+func isValidBotToken(token string) bool {
+	parts := strings.Split(token, ":")
+	if len(parts) != 2 {
+		return false
+	}
+
+	// Проверяем что первая часть - только цифры
+	if _, err := strconv.Atoi(parts[0]); err != nil {
+		return false
+	}
+
+	// Проверяем длину второй части
+	if len(parts[1]) < 10 {
+		return false
+	}
+
+	return true
+}
+
+// Переработанный обработчик выбора шаблона
+func handleSelectTemplateForBot(callback *tgbotapi.CallbackQuery) {
+	parts := strings.Split(callback.Data, ":")
+	if len(parts) < 2 {
+		sendMessage(callback.Message.Chat.ID, "❌ Ошибка выбора шаблона")
+		return
+	}
+
+	templateID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		sendMessage(callback.Message.Chat.ID, "❌ Неверный ID шаблона")
+		return
+	}
+
+	state := getUserState(callback.From.ID)
+	if state == nil || state.BotToken == "" {
+		sendMessage(callback.Message.Chat.ID, "❌ Не найден токен бота. Начните процесс заново.")
+		clearUserState(callback.From.ID)
+		return
+	}
+
+	state.TempData["template_id"] = templateID
+	state.CurrentAction = "awaiting_ref_code"
+
+	msg := tgbotapi.NewMessage(callback.Message.Chat.ID,
+		"Введите реферальный код для бота (или нажмите /skip для автоматической генерации):\n\n"+
+			fmt.Sprintf("Токен: %s\nШаблон ID: %d", maskToken(state.BotToken), templateID))
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Пропустить", "skip_ref_code"),
+		),
+	)
+	send(msg)
+}
+
+// Функция подтверждения создания бота
+func confirmBotCreation(chatID int64, userID int64) {
+	state := getUserState(userID)
+	if state == nil || state.BotToken == "" {
+		sendMessage(chatID, "❌ Ошибка: данные бота не найдены")
+		return
+	}
+
+	templateID, ok := state.TempData["template_id"].(int64)
+	if !ok {
+		sendMessage(chatID, "❌ Ошибка: шаблон не выбран")
+		return
+	}
+
+	refCode, ok := state.TempData["ref_code"].(string)
+	if !ok {
+		refCode = generateRefCode()
+	}
+
+	// Создаем бота в БД
+	if err := createBotInDB(userID, state.BotToken, templateID, refCode); err != nil {
+		sendMessage(chatID, "❌ Ошибка при создании бота: "+err.Error())
+		return
+	}
+
+	// Регистрируем вебхук
+	if err := registerWebhook(state.BotToken); err != nil {
+		sendMessage(chatID, "⚠️ Бот создан, но не удалось зарегистрировать вебхук: "+err.Error())
+	} else {
+		sendMessage(chatID, "✅ Вебхук успешно зарегистрирован")
+	}
+
+	go startBotWorker(state.BotToken, templateID)
+
+	sendMessage(chatID, fmt.Sprintf(
+		"✅ Бот успешно создан!\n\n"+
+			"Токен: %s\n"+
+			"Шаблон ID: %d\n"+
+			"Реферальный код: %s",
+		maskToken(state.BotToken), templateID, refCode))
+
+	clearUserState(userID)
+}
+
+// Модифицированная функция маскировки токена
+func maskToken(token string) string {
+	parts := strings.Split(token, ":")
+	if len(parts) != 2 {
+		return "invalid_token"
+	}
+	return parts[0] + ":****" + parts[1][len(parts[1])-4:]
 }
