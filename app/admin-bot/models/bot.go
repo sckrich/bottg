@@ -23,14 +23,15 @@ type BotAccess struct {
 	GrantedAt   time.Time `db:"granted_at" json:"granted_at"`
 }
 type BotTemplate struct {
-	ID        int64     `db:"id" json:"id"`
-	BotID     int64     `db:"bot_id" json:"bot_id"`
-	Name      string    `db:"name" json:"name"`
-	Content   string    `db:"content" json:"content"`
-	Keyboard  StateData `db:"keyboard" json:"keyboard"`
-	IsActive  bool      `db:"is_active" json:"is_active"`
-	CreatedAt time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+	BotID     int64           `db:"bot_id" json:"bot_id"`
+	ID        int64           `db:"id" json:"id"`
+	UserID    int64           `db:"user_id" json:"user_id"`
+	Name      string          `db:"name" json:"name"`
+	Content   string          `db:"content" json:"content"`
+	Keyboard  json.RawMessage `db:"keyboard" json:"keyboard"`
+	IsActive  bool            `db:"is_active" json:"is_active"`
+	CreatedAt time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time       `db:"updated_at" json:"updated_at"`
 }
 
 type BotState struct {
